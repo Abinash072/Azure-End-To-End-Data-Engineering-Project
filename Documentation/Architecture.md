@@ -1,1 +1,1 @@
-![Architecture Diagram](Documentation/Architecture.png)
+![Architecture Diagram](Architecture.png)
