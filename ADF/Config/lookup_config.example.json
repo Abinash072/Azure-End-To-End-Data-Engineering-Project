@@ -1,0 +1,12 @@
+[
+  {
+    "p_rel_url": "<relative-path-to>/AdventureWorks_Calendar.csv",
+    "p_sink_folder": "AdventureWorks_Calendar",
+    "p_sink_file": "AdventureWorks_Calendar"
+  },
+  {
+    "p_rel_url": "<relative-path-to>/AdventureWorks_Customers.csv",
+    "p_sink_folder": "AdventureWorks_Customers",
+    "p_sink_file": "AdventureWorks_Customers"
+  }
+]
