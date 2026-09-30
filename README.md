@@ -17,19 +17,15 @@ A complete cloud data pipeline built on the **AdventureWorks dataset**, covering
 
 - [Project Overview](#-project-overview)
 - [Architecture](#%EF%B8%8F-architecture)
-  - [Solution architecture](#high-level-solution-architecture)
-  - [Security and access](#security-and-access)
-  - [Pipeline flow](#data-pipeline-flow)
-  - [Data model](#gold-layer-data-model-star-schema)
 - [Tech Stack](#%EF%B8%8F-tech-stack)
 - [Dataset](#-dataset)
 - [Bronze Layer](#-bronze-layer--raw-data)
 - [Silver Layer](#-silver-layer--cleaned-data)
 - [Gold Layer](#-gold-layer--azure-synapse-analytics)
 - [Power BI](#-power-bi)
-- [Data Quality](#-data-quality)
-- [Project Structure](#-project-structure)
-- [Getting Started](#-getting-started)
+- [Data Validation](#-data-validation)
+- [Repository Structure](#-repository-structure)
+- [Getting Started](#%EF%B8%8F-getting-started)
 - [Key Learnings](#-key-learnings)
 - [Future Improvements](#-future-improvements)
 - [Author](#-author)
@@ -40,10 +36,9 @@ A complete cloud data pipeline built on the **AdventureWorks dataset**, covering
 
 The goal was to build an end-to-end pipeline that:
 
-- Ingests source data with **Azure Data Factory**
-- Lands it in **Azure Data Lake Storage Gen2**
-- Cleans and transforms it with **Azure Databricks + PySpark**
-- Runs data quality checks and stores results as **Parquet**
+- Ingests source files with a **metadata-driven Azure Data Factory pipeline** (Lookup → ForEach → Copy)
+- Lands them in **Azure Data Lake Storage Gen2** (Bronze)
+- Cleans and transforms them with **Azure Databricks + PySpark** and stores **Parquet** (Silver)
 - Builds a **Gold layer** in **Azure Synapse Analytics** using `OPENROWSET`, SQL views, and external tables
 - Connects the Gold datasets to **Power BI** for reporting
 
@@ -53,19 +48,19 @@ The goal was to build an end-to-end pipeline that:
 
 ### High-level solution architecture
 
-The solution is organised into five zones: **Ingest → Store → Process → Serve → Consume**. Each zone maps to one Azure service, and data moves through the Bronze, Silver, and Gold layers of the medallion architecture.
+The solution is organised into zones: **Source → Ingest → Store → Process → Serve → Consume**. Data moves through the Bronze, Silver, and Gold layers of the medallion architecture.
 
 ```mermaid
 flowchart LR
     subgraph SRC["1 · Source"]
-        S1[("AdventureWorks<br/>10 CSV files")]
+        S1[("AdventureWorks<br/>10 files over HTTP")]
     end
 
     subgraph ING["2 · Ingest"]
-        ADF["Azure Data Factory<br/>Pipelines · Copy Activity"]
+        ADF["Azure Data Factory<br/>Lookup · ForEach · Copy"]
     end
 
-    subgraph LAKE["3 · Store — ADLS Gen2 (Data Lake)"]
+    subgraph LAKE["3 · Store — ADLS Gen2"]
         direction TB
         BR[("🥉 Bronze<br/>Raw CSV")]
         SL[("🥈 Silver<br/>Cleaned Parquet")]
@@ -73,7 +68,7 @@ flowchart LR
     end
 
     subgraph PRO["4 · Process"]
-        DBX["Azure Databricks<br/>PySpark notebooks<br/>Cleaning · Transform · DQ checks"]
+        DBX["Azure Databricks<br/>PySpark notebook<br/>Clean · Transform"]
     end
 
     subgraph SRV["5 · Serve"]
@@ -84,13 +79,13 @@ flowchart LR
         PBI["Power BI<br/>Reports & Dashboards"]
     end
 
-    S1 -->|"Ingest"| ADF
+    S1 -->|"HTTP"| ADF
     ADF -->|"Copy"| BR
-    BR -->|"Read"| DBX
+    BR -->|"Read CSV"| DBX
     DBX -->|"Write Parquet"| SL
     SL -->|"OPENROWSET"| SYN
     SYN -->|"CREATE EXTERNAL TABLE AS SELECT"| GD
-    SYN -->|"DirectQuery / Import"| PBI
+    SYN -->|"Import / DirectQuery"| PBI
 
     classDef store fill:#e8f1fb,stroke:#0078d4,color:#000;
     class BR,SL,GD store;
@@ -98,37 +93,39 @@ flowchart LR
 
 ### Security and access
 
-Services authenticate with **Managed Identity** and are authorised through **Azure RBAC** on the storage account, so no keys or secrets appear in code.
+| Component | How it authenticates to ADLS Gen2 |
+| --- | --- |
+| Azure Databricks | Service principal (OAuth client credentials). Client ID, secret and tenant ID are read from a **Databricks secret scope**, never hard-coded |
+| Azure Synapse | **Managed Identity** through a database-scoped credential |
+| Azure Data Factory | Linked service (configured in ADF) |
 
 ```mermaid
 flowchart LR
-    ADFm["Data Factory<br/>(Managed Identity)"] -- "Storage Blob Data Contributor" --> ADLS[("ADLS Gen2")]
-    DBXm["Databricks<br/>(Access Connector / Service Principal)"] -- "Storage Blob Data Contributor" --> ADLS
-    SYNm["Synapse<br/>(Managed Identity)"] -- "Storage Blob Data Reader / Contributor" --> ADLS
-    PBIu["Power BI user"] -- "SQL auth / Entra ID" --> SYNm
+    DBX["Databricks<br/>Service principal (OAuth)"] --> ADLS[("ADLS Gen2")]
+    KV["Databricks secret scope<br/>(Key Vault-backed recommended)"] -.->|"client id / secret / tenant"| DBX
+    SYN["Synapse<br/>Managed Identity"] --> ADLS
+    ADF["Data Factory<br/>Linked service"] --> ADLS
+    PBI["Power BI"] -->|"SQL endpoint"| SYN
 ```
 
 ### Data pipeline flow
 
 ```mermaid
 flowchart TD
-    A([Start: trigger or manual run]) --> B[ADF copies source files to Bronze]
-    B --> C{Copy succeeded?}
-    C -- No --> X[/Retry or fail pipeline/]
-    C -- Yes --> D[Databricks reads Bronze]
-    D --> E["Clean · convert types and dates<br/>handle missing values · derive columns"]
-    E --> F{Data quality checks pass?}
-    F -- No --> Y[/Fix data or fail the run/]
-    F -- Yes --> G[Write Parquet to Silver]
-    G --> H["Synapse: OPENROWSET views (Gold.*)"]
-    H --> I["CETAS: external tables to Gold container"]
-    I --> J[Power BI refresh]
-    J --> K([End])
+    A([Start: trigger or manual run]) --> B["ADF Lookup reads config JSON<br/>(one entry per file)"]
+    B --> C["ForEach: Copy each file over HTTP → Bronze"]
+    C --> D["Databricks reads Bronze CSV"]
+    D --> E["Convert types and dates · derive columns<br/>bucket sizes and income · handle invalid values"]
+    E --> F["Write Parquet to Silver"]
+    F --> G["Synapse: OPENROWSET views (gold.*)"]
+    G --> H["CETAS: external tables to Gold container"]
+    H --> I["Power BI connects to Gold"]
+    I --> J([End])
 ```
 
-### Gold layer data model (star schema)
+### Logical data model (star schema)
 
-The Gold layer is modelled as a **star schema**. Sales and Returns are fact tables. Calendar, Products, Customers, and Territories are dimensions. Products roll up through Subcategories to Categories.
+AdventureWorks has a star-schema shape: Sales and Returns are fact tables; Calendar, Products, Customers, and Territories are dimensions. Products roll up through Subcategories to Categories. Gold exposes Sales 2015, 2016, and 2017 as three separate tables, which are treated as one logical `FACT_SALES`.
 
 ```mermaid
 erDiagram
@@ -150,7 +147,7 @@ erDiagram
         int CustomerKey FK
         int TerritoryKey FK
         int OrderQuantity
-        int SellingTime "derived: StockDate - OrderDate"
+        int SellingTimeDays "derived: StockDate - OrderDate"
     }
     FACT_RETURNS {
         date ReturnDate FK
@@ -163,10 +160,12 @@ erDiagram
         int ProductSubcategoryKey FK
         string ProductName
         string SerialNo "derived"
+        string Catagory "derived"
     }
     DIM_CUSTOMERS {
         int CustomerKey PK
-        string FullName
+        string Full_Name "derived"
+        string IncomeType "derived"
     }
     DIM_TERRITORIES {
         int SalesTerritoryKey PK
@@ -175,6 +174,9 @@ erDiagram
     }
     DIM_CALENDAR {
         date Date PK
+        int Day "derived"
+        int Month "derived"
+        int Year "derived"
     }
     DIM_SUBCATEGORIES {
         int ProductSubcategoryKey PK
@@ -187,7 +189,7 @@ erDiagram
     }
 ```
 
-> Column lists are indicative. Adjust them to match your actual Silver schemas. `FACT_SALES` is the union of Sales 2015, 2016, and 2017.
+> Column lists are indicative. Relationships are defined in Power BI's model view.
 
 ---
 
@@ -195,7 +197,7 @@ erDiagram
 
 | Technology | Purpose |
 | --- | --- |
-| **Azure Data Factory (ADF)** | Data ingestion and pipeline orchestration |
+| **Azure Data Factory (ADF)** | Metadata-driven ingestion and orchestration |
 | **Azure Data Lake Storage Gen2** | Cloud data lake storage |
 | **Azure Databricks** | Data processing and transformation |
 | **PySpark** | Data cleaning and transformation |
@@ -216,7 +218,7 @@ The project uses the **AdventureWorks** dataset, made up of 10 files:
 
 ## 🥉 Bronze Layer — Raw Data
 
-Azure Data Factory moves the source files into the data lake unchanged.
+The ADF pipeline [`dynamic_git_pipeline`](ADF/pipelines/dynamic_git_pipeline.json) loads all files into the `bronze` container with a single **Lookup → ForEach → Copy** flow driven by a config JSON. See [ADF/README.md](ADF/README.md).
 
 ```text
 bronze/
@@ -236,15 +238,16 @@ bronze/
 
 ## 🥈 Silver Layer — Cleaned Data
 
-Databricks and PySpark clean and transform the Bronze data, and the results are written to ADLS Gen2 as **Parquet**.
+The notebook [`silver_layer.ipynb`](Databricks/notebooks/silver_layer.ipynb) reads each Bronze dataset, transforms it, and writes **Parquet** to the `silver` container.
 
-**Transformations**
-
-- Data type and date conversion
-- Missing-value handling
-- String manipulation and column splitting
-- Derived columns
-- Aggregations where required
+| Dataset | Transformations |
+| --- | --- |
+| Calendar | `Date` converted to a date type; `Day`, `Month`, `Year` derived |
+| Customers | `Full_Name` built from prefix, first and last name; `Income Type` band (High / Medium / Low) from `AnnualIncome` |
+| Products | `Serial No` (`ProductKey-ProductSubcategoryKey`); `Catagory` split from `ProductName`; `ProductSize` mapped to S / M / L / XL, with `0` set to null |
+| Returns | `ReturnDate` converted to a date type |
+| Sales 2015–2017 | `OrderDate` and `StockDate` converted to dates; `Selling Time(In Days)` derived |
+| Categories, Subcategories, Territories | Loaded as-is to Parquet |
 
 **Example — derived column**
 
@@ -255,82 +258,68 @@ df_products = df_products.withColumn(
 )
 ```
 
-**Example — date conversion**
-
-```python
-df_returns = df_returns.withColumn(
-    "ReturnDate",
-    to_date("ReturnDate", "M/d/yyyy")
-)
-```
-
 **Example — date difference**
 
 ```python
-df_sales_2015 = df_sales_2015.withColumn(
-    "Selling Time",
-    datediff(col("StockDate"), col("OrderDate"))
+df_sales = (
+    df_sales
+    .withColumn("OrderDate", to_date("OrderDate", "M/d/yyyy"))
+    .withColumn("StockDate", to_date("StockDate", "M/d/yyyy"))
+    .withColumn("Selling Time(In Days)", datediff(col("StockDate"), col("OrderDate")))
 )
 ```
+
+Storage access uses a service principal, with credentials read from a Databricks secret scope (see [Getting Started](#%EF%B8%8F-getting-started)).
 
 ---
 
 ## 🥇 Gold Layer — Azure Synapse Analytics
 
-Synapse exposes the Silver Parquet data as an analytics-ready layer for Power BI.
+Synapse (serverless SQL pool) exposes the Silver Parquet data as an analytics-ready layer. Scripts are in [`Synapse/`](Synapse) and are numbered in run order.
 
-### 1. Credential and external data source
+| Script | Purpose |
+| --- | --- |
+| `00_create_schema.sql` | Creates the `gold` schema |
+| `01_external_data_sources.sql` | Managed-identity credential; `source_silver` and `source_gold` data sources |
+| `02_external_file_formats.sql` | `format_parquet` (Parquet, Snappy) |
+| `03_gold_views.sql` | One `gold.*` view per dataset, using `OPENROWSET` |
+| `04_external_tables.sql` | External tables (CETAS) written to the `gold` container |
 
-A managed identity credential is used, so no keys or secrets are stored in the code.
+**Credential and data source**
 
 ```sql
 CREATE DATABASE SCOPED CREDENTIAL cred_papu
-WITH IDENTITY = 'Managed identity';
+WITH IDENTITY = 'Managed Identity';
 
 CREATE EXTERNAL DATA SOURCE source_gold
 WITH (
-    LOCATION = 'https://<storage-account>.blob.core.windows.net/gold/',
+    LOCATION   = 'https://<storage-account>.dfs.core.windows.net/gold/',
     CREDENTIAL = cred_papu
 );
 ```
 
-### 2. External file format
+**Gold view with `OPENROWSET`**
 
 ```sql
-CREATE EXTERNAL FILE FORMAT format_parquet
-WITH (
-    FORMAT_TYPE = PARQUET,
-    DATA_COMPRESSION = 'org.apache.hadoop.io.compress.SnappyCodec'
-);
-```
-
-### 3. Gold views with `OPENROWSET`
-
-A view is created over each Silver dataset (Calendar, Customers, Product Categories, Product Subcategories, Products, Returns, Sales 2015–2017, Territories).
-
-```sql
-CREATE VIEW Gold.Products
+CREATE OR ALTER VIEW gold.products
 AS
 SELECT *
 FROM OPENROWSET(
-    BULK 'https://<storage-account>.blob.core.windows.net/silver/AdventureWorks_Products/',
+    BULK 'https://<storage-account>.blob.core.windows.net/silver/AdventureWorks_Products/*.parquet',
     FORMAT = 'PARQUET'
 ) AS QUERY2;
 ```
 
-### 4. External tables (CETAS)
-
-The output of a Gold view is persisted as Parquet in the Gold container and stays queryable through SQL.
+**External table (CETAS)** — persists the result of a Gold view as Parquet while keeping it queryable through SQL.
 
 ```sql
-CREATE EXTERNAL TABLE extcalendar
+CREATE EXTERNAL TABLE ext_calendar
 WITH (
-    LOCATION = 'ext_calendar',
+    LOCATION    = 'calendar',
     DATA_SOURCE = source_gold,
     FILE_FORMAT = format_parquet
-)
-AS
-SELECT * FROM Gold.Calendar;
+) AS
+SELECT * FROM gold.calendar;
 ```
 
 ---
@@ -339,39 +328,44 @@ SELECT * FROM Gold.Calendar;
 
 The Gold datasets from Synapse are connected to **Power BI** to build reports and dashboards.
 
-> 💡 Add dashboard screenshots here, e.g. `![Dashboard](PowerBI/dashboards/dashboard.png)`
+> 💡 Add dashboard screenshots to `PowerBI/dashboards/` and embed them here, e.g. `![Dashboard](PowerBI/dashboards/dashboard.png)`
 
 ---
 
-## 🧪 Data Quality
+## 🧪 Data Validation
 
-Checks run during transformation, before data reaches Gold:
-
-- Data type and date validation
-- Missing-value and invalid-value handling
-- Derived-column and transformation validation
-- Verification of Silver Parquet output
-- Validation of Gold SQL views and external tables
+- Date and data-type conversion in the Silver layer
+- Invalid product sizes (`0`) handled as nulls; NULL-safe name concatenation
+- Derived columns checked by inspecting the output
+- Row counts of every Silver dataset verified in the notebook's final cell
+- Gold views and external tables validated by querying them in Synapse
 
 ---
 
-## 📁 Project Structure
+## 📁 Repository Structure
 
 ```text
 Azure-AdventureWorks-DataEngineering/
 ├── ADF/
+│   ├── README.md
+│   ├── config/
+│   │   └── lookup_config.example.json
 │   └── pipelines/
+│       └── dynamic_git_pipeline.json
 ├── Databricks/
 │   └── notebooks/
+│       └── silver_layer.ipynb
 ├── Synapse/
-│   ├── external_data_sources.sql
-│   ├── external_file_formats.sql
-│   ├── gold_views.sql
-│   └── external_tables.sql
+│   ├── 00_create_schema.sql
+│   ├── 01_external_data_sources.sql
+│   ├── 02_external_file_formats.sql
+│   ├── 03_gold_views.sql
+│   └── 04_external_tables.sql
 ├── PowerBI/
 │   └── dashboards/
 ├── Documentation/
 │   └── architecture/
+├── .gitignore
 └── README.md
 ```
 
@@ -382,20 +376,22 @@ Azure-AdventureWorks-DataEngineering/
 **Prerequisites:** an Azure subscription with Data Factory, a Storage Account (ADLS Gen2, hierarchical namespace enabled), Databricks, and a Synapse workspace; Power BI Desktop.
 
 1. **Create containers** `bronze`, `silver`, and `gold` in your ADLS Gen2 account.
-2. **Ingest data:** import the pipelines from `ADF/pipelines/` and run them to load the AdventureWorks files into `bronze`.
-3. **Transform:** run the notebooks in `Databricks/notebooks/` to write cleaned Parquet to `silver`.
-4. **Serve:** run the scripts in `Synapse/` in order: data sources → file formats → views → external tables. Replace `<storage-account>` with your account name.
-5. **Visualize:** connect Power BI to the Synapse serverless SQL endpoint and load the Gold views.
+2. **Ingest:** import `ADF/pipelines/dynamic_git_pipeline.json`, create the linked services and datasets it references, add your config JSON (see `ADF/config/`), and run the pipeline.
+3. **Set up Databricks access:** register a service principal, grant it *Storage Blob Data Contributor* on the storage account, and store its client ID, client secret and tenant ID in a secret scope.
+4. **Transform:** import `Databricks/notebooks/silver_layer.ipynb`, set `STORAGE_ACCOUNT` and `SECRET_SCOPE`, and run all cells.
+5. **Serve:** run the scripts in `Synapse/` in numeric order (00 → 04), replacing `<storage-account>` with your account name.
+6. **Visualize:** connect Power BI to the Synapse serverless SQL endpoint and load the Gold tables.
 
-> ⚠️ Never commit storage keys, connection strings, or tokens. Use managed identity or Azure Key Vault.
+> ⚠️ Never commit storage keys, client secrets, connection strings, or tokens. Use secret scopes, Key Vault, or managed identity.
 
 ---
 
 ## 🎯 Key Learnings
 
-- Building ingestion pipelines with Azure Data Factory
+- Building metadata-driven ingestion pipelines with Azure Data Factory
 - Designing a Bronze/Silver/Gold architecture on ADLS Gen2
-- Data cleaning, transformation, and quality checks with PySpark
+- Data cleaning and transformation with PySpark
+- Secure storage access with service principals and secret scopes
 - Serving Parquet data through Synapse with `OPENROWSET`, external data sources, file formats, views, and external tables
 - Connecting a SQL serving layer to Power BI
 
@@ -404,13 +400,13 @@ Azure-AdventureWorks-DataEngineering/
 ## 🚀 Future Improvements
 
 - [ ] Incremental data loading
-- [ ] Metadata-driven pipelines
-- [ ] Automated pipeline monitoring and alerting
-- [ ] Advanced data quality framework
+- [ ] Automated data quality checks (e.g. Great Expectations or Deequ)
+- [ ] Pipeline monitoring and alerting
+- [ ] Key Vault-backed secret scope
+- [ ] Delta Lake in the Silver layer
 - [ ] CI/CD for ADF, Databricks, and Synapse
 - [ ] Performance optimization and data partitioning
 - [ ] Incremental refresh in Power BI
-- [ ] Additional business-level transformations
 
 ---
 
