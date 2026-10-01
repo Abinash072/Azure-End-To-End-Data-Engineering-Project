@@ -416,7 +416,7 @@ Azure-AdventureWorks-DataEngineering/
 Electronics & Telecommunication Engineering, IGIT Sarang
 Interested in Data Engineering, Cloud Technologies, Analytics, and FinTech.
 
-[LinkedIn](https://www.linkedin.com/in/your-profile) · [GitHub](https://github.com/your-username)
+[LinkedIn](linkedin.com/in/sahooabinash072) · [GitHub](github.com/Abinash072)
 
 ---
 
